@@ -23,6 +23,12 @@ class FakeUpstream:
         self.range_calls: list[tuple[str, str | None]] = []
         self.fail_next = False
         self.down = False
+        # Simulates an origin that ignores the Range header entirely and
+        # always returns the whole file with 200 — real CHELSA client code
+        # defends against exactly this (RangeFiles.java), and the sibling
+        # MINECRAFT-573/JRC lane's review found a proxy that didn't
+        # (MINECRAFT-581).
+        self.ignore_range_next = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -58,7 +64,10 @@ class FakeUpstream:
                     self.wfile.write(payload)
                     return
 
-                if not range_header or not range_header.startswith("bytes="):
+                ignore_range = outer.ignore_range_next
+                if ignore_range:
+                    outer.ignore_range_next = False
+                if not range_header or not range_header.startswith("bytes=") or ignore_range:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/octet-stream")
                     self.send_header("Content-Length", str(len(content)))

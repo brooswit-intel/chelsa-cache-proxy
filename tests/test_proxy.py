@@ -248,6 +248,34 @@ class ProxyTestCase(unittest.TestCase):
         # Never the real upstream's own 503 body either.
         self.assertNotIn(b"simulated upstream failure", body)
 
+    def test_upstream_ignoring_range_is_sliced_down_not_cached_whole(self) -> None:
+        # Real CHELSA client code (RangeFiles.java) defends against an
+        # origin that answers a Range request with a full 200 instead of a
+        # 206 — and the sibling MINECRAFT-573/JRC lane's review (581) found
+        # a proxy that didn't handle this and mis-accounted bytes as a
+        # result. Prove this proxy slices such a response down to the
+        # requested range before ever caching or returning it.
+        server = self._start_server()
+        port = server.server_address[1]
+        self.upstream.ignore_range_next = True
+
+        status, body = _get(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.dem_bytes[10:20])
+        self.assertEqual(len(body), 10)
+
+        # Cached under the small range's own key, not the whole file.
+        stats = _stats(port)
+        self.assertEqual(stats["cached_entries"], 1)
+        self.assertEqual(stats["cached_bytes"], 10)
+
+        # A repeat of the same small range is served warm with that same
+        # 10-byte slice, not the 1024-byte whole file.
+        status2, body2 = _get(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status2, 200)
+        self.assertEqual(body2, self.dem_bytes[10:20])
+        self.assertEqual(self.upstream.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

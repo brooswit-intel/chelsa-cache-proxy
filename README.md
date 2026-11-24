@@ -108,6 +108,14 @@ Config is via environment variables, all optional:
 - Cache key is the exact `(path, byte range)` the client asked for — this
   is deterministic because the GeoTIFF/DEM layout is static, so the same
   row/chunk read always asks for the same range.
+- If the upstream ignores the `Range` request and answers `200` with the
+  whole file instead of `206` with just the requested bytes — the real
+  CHELSA client defends against exactly this in `RangeFiles.java`, and the
+  sibling MINECRAFT-573/JRC lane's review (MINECRAFT-581) found a proxy
+  that didn't — this proxy slices the body down to the exact requested
+  `[start, start+length)` range itself before caching or returning
+  anything, so a small-range request can never cache (or return) an
+  entire multi-megabyte file under one byte-range cache key.
 - The ordinary data path never inspects the Range *value* to decide
   cacheability — a `bytes=0-0` data request is cached exactly like any
   other range. The TTL-0, always-live behavior lives only in the separate
@@ -190,4 +198,8 @@ access, no live provider) and exercise:
   subsequent health check after the upstream recovers succeeds),
 - health-endpoint-never-leaks-a-non-5xx-status (a real, complete, non-2xx
   upstream answer still normalizes to `502`, never passed through as
-  something a loose "status < 500" caller could misread as healthy).
+  something a loose "status < 500" caller could misread as healthy),
+- upstream-ignoring-range-is-sliced-down (an origin that answers a Range
+  request with a full `200` instead of `206` is sliced down to the exact
+  requested range before caching, never cached or returned as the whole
+  file).

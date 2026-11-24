@@ -133,7 +133,7 @@ class Config:
         )
 
 
-def _forward(config: Config, path: str, range_header: str):
+def _forward(config: Config, path: str, range_header: str, start: int, length: int):
     """Makes one actual network send to the fixed upstream for one exact byte
     range of one allowlisted path.
 
@@ -147,6 +147,15 @@ def _forward(config: Config, path: str, range_header: str):
     - ``complete`` is False whenever the response must not be cached as
       success: a non-200/206 status, or a declared length that the actually
       delivered body didn't match (a genuine mid-transfer truncation).
+    - On a real ``200`` (the upstream ignored the Range request and
+      returned the whole file — CHELSA's own client defends against
+      exactly this in ``RangeFiles.java``: ``if (status == 200 && (offset
+      != 0 || body.length > length)) body = Arrays.copyOfRange(...)``, and
+      the sibling MINECRAFT-573/JRC lane's review found the same shape of
+      bug, MINECRAFT-581), ``body`` is sliced down to ``[start, start +
+      length)`` here before the caller ever sees it, so a small-range
+      request can never cache (or return) an entire multi-megabyte file
+      under one byte-range cache key.
     """
     base = urlsplit(config.upstream_base)
     url = urlunsplit((base.scheme, base.netloc, base.path + path, "", ""))
@@ -163,6 +172,9 @@ def _forward(config: Config, path: str, range_header: str):
             except (http.client.HTTPException, OSError):
                 return resp.status, b"", False
             complete = expected_length is None or len(raw) == int(expected_length)
+            if resp.status == 200 and complete and (start != 0 or len(raw) > length):
+                raw = raw[start:start + length]
+                complete = len(raw) == length
             return resp.status, raw, complete
     except urllib.error.HTTPError as exc:
         # 404/403 land here too: a real, complete answer from the upstream,
@@ -182,14 +194,14 @@ def make_handler(cache: Cache, config: Config):
     locks_guard = threading.Lock()
     inflight: dict[str, threading.Lock] = {}
 
-    def singleflight_fetch(key: str, path: str, range_header: str):
+    def singleflight_fetch(key: str, path: str, range_header: str, start: int, length: int):
         with locks_guard:
             lock = inflight.setdefault(key, threading.Lock())
         with lock:
             cached = cache.get(key)
             if cached is not None:
                 return "warm", cached.status, cached.body
-            status, body, complete = _forward(config, path, range_header)
+            status, body, complete = _forward(config, path, range_header, start, length)
             if status in (200, 206) and complete:
                 cache.put(key, CachedRange(status=status, body=body))
                 return "cold", status, body
@@ -227,7 +239,7 @@ def make_handler(cache: Cache, config: Config):
                 # a 404/403 that a loose caller would misread as healthy.
                 # Matches the sibling elevation-cache-proxy's /__health
                 # contract (its health_check(), same normalization).
-                status, _body, _complete = _forward(config, HEALTH_PROBE_PATH, HEALTH_PROBE_RANGE)
+                status, _body, _complete = _forward(config, HEALTH_PROBE_PATH, HEALTH_PROBE_RANGE, 0, 1)
                 cache.record_probe_send()
                 if status in (200, 206):
                     self._respond_plain(200, b"")
@@ -245,7 +257,7 @@ def make_handler(cache: Cache, config: Config):
                 return
 
             key = Cache.key(parsed.path, start, end)
-            outcome, status, body = singleflight_fetch(key, parsed.path, range_header)
+            outcome, status, body = singleflight_fetch(key, parsed.path, range_header, start, end - start + 1)
             if outcome == "warm":
                 cache.record_warm_hit()
                 self._respond_bytes(status, body)
