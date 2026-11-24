@@ -48,14 +48,26 @@ Read directly from `io.earthplatform.geography.globe.ClimateSource` +
   the other.
 - A dedicated reachability probe (`HostBackoff.check`) sends
   `GET <path>` with exactly `Range: bytes=0-0` against whichever file URI
-  the host is currently failing on. Per the cross-lane direction
-  (MINECRAFT-571 comment 55734) to route such probes through each
-  configured local proxy with the probe policy set to an explicit TTL of
-  0: this exact one-byte, offset-zero shape is detected and **always**
-  forwarded live to the real upstream, never served from or written to the
-  data cache, so a probe can never report stale success. It is counted
-  separately (`probe_sends`) so it never inflates or deflates the ordinary
-  `cold_misses`/`warm_hits` data counters.
+  the host is currently failing on. **This proxy does not special-case that
+  byte-range shape on the ordinary data path.** An earlier revision did,
+  and MINECRAFT-571 comment 55737 corrected that generally (the sibling
+  elevation-cache-proxy made and then fixed the same mistake — see its
+  comment 55766): a real `bytes=0-0` *data* request is the same shape but
+  a different intent, and would otherwise never be cacheable. The TTL-0
+  resource is instead the dedicated `GET /__health` endpoint below; wiring
+  the real client's `HostBackoff` to call it (instead of probing a data
+  file URI directly) when this proxy is configured is shared-infra work
+  across every source, not CHELSA-specific, and is left to the
+  MINECRAFT-580 coordinated integration lane.
+
+## Health endpoint
+
+`GET /__health` always makes one fresh live round trip to the real
+upstream (a 1-byte read of the fixed DEM file) and never reads from or
+writes to the data cache in either direction — TTL 0, explicitly, as
+opposed to the ordinary data paths' TTL -1 (no time-based expiry). It is
+counted separately (`probe_sends`) so it never inflates or deflates the
+ordinary `cold_misses`/`warm_hits` data counters.
 
 ## Running it
 
@@ -85,8 +97,10 @@ Config is via environment variables, all optional:
 - Cache key is the exact `(path, byte range)` the client asked for — this
   is deterministic because the GeoTIFF/DEM layout is static, so the same
   row/chunk read always asks for the same range.
-- The one-byte `bytes=0-0` reachability-probe shape is carved out of
-  ordinary caching entirely (see above) — TTL 0, always live.
+- The ordinary data path never inspects the Range *value* to decide
+  cacheability — a `bytes=0-0` data request is cached exactly like any
+  other range. The TTL-0, always-live behavior lives only in the separate
+  `/__health` endpoint (see above).
 - Concurrent identical-range misses are deduplicated (single-flight): N
   simultaneous requests for the same uncached range produce exactly one
   upstream send, and every waiter gets that one result.
@@ -108,8 +122,8 @@ survive a process restart, unlike pure in-memory counters):
 - `cold_misses` — a data range that went out over the network (success,
   error, or truncated — every attempted data send is counted here exactly
   once, regardless of outcome).
-- `probe_sends` — a `bytes=0-0` reachability probe, counted separately so
-  it never inflates or deflates the data counters above.
+- `probe_sends` — a `GET /__health` call, counted separately so it never
+  inflates or deflates the data counters above.
 
 Taking a before/after delta of this endpoint is the supported way to
 assert "N cold, 0 warm" on a fresh region and "0 cold, N warm" on a repeat
@@ -154,8 +168,12 @@ access, no live provider) and exercise:
   any upstream send, `404`),
 - concurrent-miss-dedup (eight simultaneous identical-range misses
   collapse into exactly one upstream send),
-- probe-always-live (a `bytes=0-0` probe always goes live, is never cached,
-  and is counted separately from ordinary data reads),
-- probe-fails-live-without-bypass-then-recovers (a probe against a down
-  upstream fails live through the proxy — no stale success returned — and
-  a subsequent probe after the upstream recovers succeeds).
+- ordinary-bytes-0-0-is-cached (a real one-byte data request at offset
+  zero is cached like any other range — proving the data path doesn't
+  method/range-sniff for probe-shaped requests),
+- health-endpoint-always-live (`/__health` always goes live, is never
+  cached, and is counted separately from ordinary data reads),
+- health-endpoint-fails-live-without-bypass-then-recovers (`/__health`
+  against a down upstream fails live — no stale success — while the
+  ordinary data cache stays warm through the same outage, and a
+  subsequent health check after the upstream recovers succeeds).

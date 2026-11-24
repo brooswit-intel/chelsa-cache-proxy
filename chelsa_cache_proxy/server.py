@@ -24,14 +24,27 @@ alpha.73 / combined-73, commit 88b13c33954550c6ac660dceb743a4288a9aafac,
   making that distinction — it does not reinterpret 403 as "transient" or
   vice versa.
 - A dedicated reachability probe (``HostBackoff.check``) issues
-  ``GET <path>`` with exactly ``Range: bytes=0-0`` — one byte, offset
-  zero — against whichever file URI the host is already failing on. Per
-  the cross-lane direction to route probes through the configured local
-  proxy with an explicit TTL of 0 (never infinite freshness, never stale
-  success): this exact shape is detected and always forwarded live to the
-  real upstream, never served from or written to the data cache. It is
-  counted separately (``probe_sends``) so it never inflates or deflates
-  the ordinary cold/warm data-read counters.
+  ``GET <path>`` with exactly ``Range: bytes=0-0`` against whichever file
+  URI the host is already failing on. Earlier revisions of this proxy
+  special-cased that exact byte-range shape on the ordinary data-serving
+  path — MINECRAFT-571 comment 55737 corrected that design generally (it
+  was also wrong on the sibling elevation-cache-proxy, see its comment
+  55766): the TTL-0 resource must be a *dedicated* health-check endpoint,
+  not method/range-sniffing on the tile/data resource, because a real
+  ``bytes=0-0`` *data* request (same shape, different intent) would
+  otherwise never cache either. This proxy now exposes a separate
+  ``GET /__health`` endpoint for that purpose (see below); the ordinary
+  data path no longer inspects the Range value at all. Wiring the real
+  client's ``HostBackoff`` to call ``/__health`` instead of probing a data
+  file URI directly, when this proxy is configured, is shared-infra work
+  (``HostBackoff`` is used by every source, not just CHELSA) and is left to
+  the MINECRAFT-580 coordinated integration lane, not duplicated here.
+
+``GET /__health`` always makes one fresh live round trip to the real
+upstream (a 1-byte read of the fixed DEM file) and never reads from or
+writes to the data cache in either direction — TTL 0, explicitly. It is
+counted separately (``probe_sends``) so it never inflates or deflates the
+ordinary ``cold_misses``/``warm_hits`` data counters.
 """
 
 from __future__ import annotations
@@ -56,7 +69,11 @@ ALLOWED_PATHS = {
 
 ATTRIBUTION = "CHELSA V2.1 climatologies 1981-2010, Karger et al. 2017, Scientific Data 4:170122 (CC0 1.0)"
 
-_PROBE_RANGE = "bytes=0-0"
+# The dedicated TTL-0 health endpoint always probes this one fixed, small
+# file — it does not need to vary by whichever path a client happens to be
+# failing on, since it never touches the data cache either way.
+HEALTH_PROBE_PATH = "/input/dem_geo.sdat"
+HEALTH_PROBE_RANGE = "bytes=0-0"
 
 
 class RangeNotSatisfiable(Exception):
@@ -192,6 +209,19 @@ def make_handler(cache: Cache, config: Config):
             if parsed.path == "/_internal/stats":
                 self._respond_json(200, cache.stats() | {"attribution": ATTRIBUTION})
                 return
+            if parsed.path == "/__health":
+                # Dedicated TTL-0 endpoint: always a fresh live round trip,
+                # never reads from or writes to the data cache in either
+                # direction, regardless of what Range a caller passes (the
+                # ordinary data path below never special-cases Range value
+                # at all — see the module docstring / MINECRAFT-571 55737).
+                status, body, _complete = _forward(config, HEALTH_PROBE_PATH, HEALTH_PROBE_RANGE)
+                cache.record_probe_send()
+                if status == 0:
+                    self._respond_plain(502, b"upstream unreachable")
+                    return
+                self._respond_bytes(status, body)
+                return
             if parsed.path not in ALLOWED_PATHS:
                 self._respond_plain(404, b"path not in the allowlisted CHELSA request set")
                 return
@@ -200,17 +230,6 @@ def make_handler(cache: Cache, config: Config):
                 start, end = _parse_range(range_header)
             except RangeNotSatisfiable:
                 self._respond_plain(416, b"unsupported or missing Range header")
-                return
-
-            if range_header == _PROBE_RANGE:
-                # Reachability probe: TTL 0, explicitly — never served from
-                # or written to the data cache, always a live round trip.
-                status, body, _complete = _forward(config, parsed.path, range_header)
-                cache.record_probe_send()
-                if status == 0:
-                    self._respond_plain(502, b"upstream unreachable")
-                    return
-                self._respond_bytes(status, body)
                 return
 
             key = Cache.key(parsed.path, start, end)

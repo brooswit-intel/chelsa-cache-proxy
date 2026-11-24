@@ -27,6 +27,10 @@ def _get(port: int, path: str, range_header: str | None) -> tuple[int, bytes]:
         return exc.code, exc.read()
 
 
+def _health(port: int) -> tuple[int, bytes]:
+    return _get(port, "/__health", None)
+
+
 def _stats(port: int) -> dict:
     import json
 
@@ -152,7 +156,11 @@ class ProxyTestCase(unittest.TestCase):
         # Eight concurrent identical misses collapse into one upstream send.
         self.assertEqual(self.upstream.call_count, 1)
 
-    def test_probe_range_always_goes_live_and_is_never_cached(self) -> None:
+    def test_ordinary_bytes_0_0_data_read_is_cached_like_any_other_range(self) -> None:
+        # A real `bytes=0-0` *data* request (same shape the dedicated health
+        # probe below also happens to use) must be ordinary cached data, not
+        # silently special-cased on the data path — that was the exact bug
+        # MINECRAFT-571 comment 55737 corrected (see server.py docstring).
         server = self._start_server()
         port = server.server_address[1]
 
@@ -160,37 +168,68 @@ class ProxyTestCase(unittest.TestCase):
         self.assertEqual(status, 206)
         self.assertEqual(body, self.dem_bytes[0:1])
         self.assertEqual(self.upstream.call_count, 1)
+        self.assertEqual(_stats(port)["cold_misses"], 1)
+        self.assertEqual(_stats(port)["cached_entries"], 1)
+
+        status2, body2 = _get(port, DEM_PATH, "bytes=0-0")
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, self.dem_bytes[0:1])
+        # Served from cache: no second upstream send.
+        self.assertEqual(self.upstream.call_count, 1)
+        self.assertEqual(_stats(port)["warm_hits"], 1)
+        self.assertEqual(_stats(port)["probe_sends"], 0)
+
+    def test_health_endpoint_always_goes_live_and_never_touches_data_cache(self) -> None:
+        server = self._start_server()
+        port = server.server_address[1]
+
+        status, body = _health(port)
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.dem_bytes[0:1])
+        self.assertEqual(self.upstream.call_count, 1)
         self.assertEqual(_stats(port)["probe_sends"], 1)
-        # A probe must never satisfy, or be satisfied by, the data cache.
+        # The dedicated health endpoint must never satisfy, or be satisfied
+        # by, the data cache.
         self.assertEqual(_stats(port)["cached_entries"], 0)
+        self.assertEqual(_stats(port)["cold_misses"], 0)
+        self.assertEqual(_stats(port)["warm_hits"], 0)
 
         # A second probe still goes live (TTL 0 — never infinite freshness).
-        status2, _ = _get(port, DEM_PATH, "bytes=0-0")
+        status2, _ = _health(port)
         self.assertEqual(status2, 206)
         self.assertEqual(self.upstream.call_count, 2)
 
-        # Now that an ordinary data read for the same bytes happens, it is
-        # cached as ordinary data, separate from the probe counter.
+        # An ordinary data read for the exact same bytes is still cached as
+        # ordinary data, entirely separate from the probe counter.
         status3, _ = _get(port, DEM_PATH, "bytes=0-7")
         self.assertEqual(status3, 206)
         self.assertEqual(self.upstream.call_count, 3)
         self.assertEqual(_stats(port)["cold_misses"], 1)
         self.assertEqual(_stats(port)["probe_sends"], 2)
 
-    def test_probe_fails_live_without_bypass_then_recovers(self) -> None:
+    def test_health_endpoint_fails_live_without_bypass_then_recovers(self) -> None:
         server = self._start_server()
         port = server.server_address[1]
         # Prewarm ordinary data so a probe-vs-data confusion would show up
-        # as a stale success instead of a live failure.
+        # as a stale success (served from the warm data cache) instead of a
+        # live health-check failure.
         _get(port, DEM_PATH, "bytes=0-0")
-        self.assertEqual(_stats(port)["probe_sends"], 1)
+        self.assertEqual(_stats(port)["warm_hits"], 0)
+        self.assertEqual(_stats(port)["cold_misses"], 1)
 
         self.upstream.down = True
-        status, _ = _get(port, DEM_PATH, "bytes=0-0")
+        status, _ = _health(port)
         self.assertEqual(status, 502)
 
+        # The ordinary data cache stays warm through the outage, untouched
+        # by the health endpoint's own live failure.
+        status_data, body_data = _get(port, DEM_PATH, "bytes=0-0")
+        self.assertEqual(status_data, 206)
+        self.assertEqual(body_data, self.dem_bytes[0:1])
+        self.assertEqual(_stats(port)["warm_hits"], 1)
+
         self.upstream.down = False
-        status2, body2 = _get(port, DEM_PATH, "bytes=0-0")
+        status2, body2 = _health(port)
         self.assertEqual(status2, 206)
         self.assertEqual(body2, self.dem_bytes[0:1])
 
