@@ -37,6 +37,11 @@ class FakeUpstream:
         # (BrokenPipeError) is observed well before the whole body would
         # otherwise have gone out.
         self.last_sent_bytes = 0
+        # Declares a Content-Length far larger than the actual body sent —
+        # simulates an upstream claiming a response bigger than this
+        # proxy's defensive ceiling, to prove it's rejected before any
+        # read is attempted (not just after a slow full download).
+        self.huge_content_length_next = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -50,6 +55,16 @@ class FakeUpstream:
 
                 if outer.down:
                     self.connection.close()
+                    return
+
+                if outer.huge_content_length_next:
+                    outer.huge_content_length_next = False
+                    payload = b"short body, bogus declared length"
+                    self.send_response(206)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(200 << 20))  # 200 MiB, a lie
+                    self.end_headers()
+                    self.wfile.write(payload)
                     return
 
                 if outer.fail_next:

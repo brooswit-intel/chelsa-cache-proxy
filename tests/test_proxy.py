@@ -335,6 +335,25 @@ class ProxyTestCase(unittest.TestCase):
         # touched by this probe either.
         self.assertEqual(_stats(port)["cached_entries"], 0)
 
+    def test_declared_oversized_response_is_rejected_before_reading(self) -> None:
+        # Mirrors the defensive ceiling added to the sibling MINECRAFT-577
+        # lanes (55839/55846): a declared Content-Length bigger than this
+        # proxy's own ceiling must be rejected before any body read is
+        # attempted at all, not merely after a slow full download.
+        server = self._start_server()
+        port = server.server_address[1]
+        self.upstream.huge_content_length_next = True
+
+        status, body = _get(port, DEM_PATH, "bytes=0-7")
+        self.assertEqual(status, 206)  # real status still forwarded through
+        self.assertEqual(body, b"")  # never the bogus body either
+        self.assertEqual(_stats(port)["cached_entries"], 0)
+
+        # Retryable: a normal request right after still works.
+        status2, body2 = _get(port, DEM_PATH, "bytes=0-7")
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, self.dem_bytes[0:8])
+
 
 if __name__ == "__main__":
     unittest.main()

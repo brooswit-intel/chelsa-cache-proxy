@@ -143,6 +143,16 @@ Config is via environment variables, all optional:
   upstream send, and every waiter gets that one result.
 - The cache is bounded (`PROXY_MAX_CACHE_BYTES`); exceeding it evicts the
   least-recently-accessed entries, not a blanket flush.
+- A single forwarded response — declared or actually delivered — over
+  64 MiB (`_MAX_FORWARD_BYTES`) is rejected before being fully read, never
+  cached. The real DEM file is the whole global raw-float grid and the
+  GeoTIFF files are each hundreds of MB; if the upstream ever ignores
+  Range on one of those, an unbounded read would pull the entire file
+  into memory for one small request — the sibling MINECRAFT-577 lanes
+  (HRDEM's own 1-10 GB mosaics) hit the identical risk and added the same
+  kind of ceiling (MINECRAFT-571 55839/55846). This is generous headroom
+  for CHELSA's own actual row/header sizes (a few hundred KiB at most),
+  not a tight budget.
 
 ## Metrics
 
@@ -226,4 +236,8 @@ access, no live provider) and exercise:
   on anything else is `404`),
 - health-probe-does-not-read-a-range-ignoring-whole-file (against a large
   fixture file with Range ignored, the probe's connection closes long
-  before the whole body goes out, and the data cache stays untouched).
+  before the whole body goes out, and the data cache stays untouched),
+- declared-oversized-response-is-rejected-before-reading (a declared
+  Content-Length over the 64 MiB ceiling is rejected and never cached,
+  with the real status still forwarded through; a normal request right
+  after still works).

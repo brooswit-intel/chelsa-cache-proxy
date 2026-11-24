@@ -75,6 +75,15 @@ ATTRIBUTION = "CHELSA V2.1 climatologies 1981-2010, Karger et al. 2017, Scientif
 HEALTH_PROBE_PATH = "/input/dem_geo.sdat"
 HEALTH_PROBE_RANGE = "bytes=0-0"
 
+# Defensive ceiling on any single ordinary-data forward: real CHELSA rows
+# and headers are a few hundred KiB at most (MAX_ROW_BYTES/MAX_HEADER_BYTES
+# in ClimateSource.java are 1 MiB / 2 MiB), so this is generous headroom,
+# not a tight budget — it exists to bound worst-case memory use if the
+# upstream ever ignores Range on one of the multi-hundred-MB GeoTIFFs or
+# the tens-of-GiB raw DEM file, not to reject anything CHELSA actually
+# sends in practice.
+_MAX_FORWARD_BYTES = 64 << 20
+
 
 class RangeNotSatisfiable(Exception):
     pass
@@ -156,6 +165,15 @@ def _forward(config: Config, path: str, range_header: str, start: int, length: i
       length)`` here before the caller ever sees it, so a small-range
       request can never cache (or return) an entire multi-megabyte file
       under one byte-range cache key.
+    - A declared or actually-delivered body over ``_MAX_FORWARD_BYTES`` is
+      never fully buffered: the real DEM file is the whole global raw-float
+      grid (tens of GiB) and the GeoTIFF files are each hundreds of MB —
+      if the upstream ever ignores Range on one of those, an unbounded
+      read would pull the entire file into memory just to serve one small
+      request. The sibling MINECRAFT-577 lanes (HRDEM's own 1-10 GB
+      mosaics) hit the identical shape of risk and added the same kind of
+      ceiling (MINECRAFT-571 55839/55846). Treated as truncated/uncacheable,
+      never as success.
     """
     base = urlsplit(config.upstream_base)
     url = urlunsplit((base.scheme, base.netloc, base.path + path, "", ""))
@@ -167,9 +185,13 @@ def _forward(config: Config, path: str, range_header: str, start: int, length: i
     try:
         with urllib.request.urlopen(req, timeout=config.timeout_seconds) as resp:
             expected_length = resp.headers.get("Content-Length")
+            if expected_length is not None and int(expected_length) > _MAX_FORWARD_BYTES:
+                return resp.status, b"", False
             try:
-                raw = resp.read()
+                raw = resp.read(_MAX_FORWARD_BYTES + 1)
             except (http.client.HTTPException, OSError):
+                return resp.status, b"", False
+            if len(raw) > _MAX_FORWARD_BYTES:
                 return resp.status, b"", False
             complete = expected_length is None or len(raw) == int(expected_length)
             if resp.status == 200 and complete and (start != 0 or len(raw) > length):
