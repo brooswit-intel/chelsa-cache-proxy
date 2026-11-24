@@ -29,6 +29,14 @@ class FakeUpstream:
         # MINECRAFT-573/JRC lane's review found a proxy that didn't
         # (MINECRAFT-581).
         self.ignore_range_next = False
+        # How many bytes of the last ignore-Range 200 response the client
+        # actually consumed before closing the connection (or the full
+        # body, if it read to the end) — proves a bounded-read caller
+        # (the /__health probe) never pulls in a huge body just to check
+        # liveness. Written in small chunks so an early client disconnect
+        # (BrokenPipeError) is observed well before the whole body would
+        # otherwise have gone out.
+        self.last_sent_bytes = 0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -72,7 +80,15 @@ class FakeUpstream:
                     self.send_header("Content-Type", "application/octet-stream")
                     self.send_header("Content-Length", str(len(content)))
                     self.end_headers()
-                    self.wfile.write(content)
+                    sent = 0
+                    chunk_size = 64
+                    try:
+                        for offset in range(0, len(content), chunk_size):
+                            self.wfile.write(content[offset:offset + chunk_size])
+                            sent += min(chunk_size, len(content) - offset)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    outer.last_sent_bytes = sent
                     return
 
                 start_s, _, end_s = range_header[len("bytes="):].partition("-")

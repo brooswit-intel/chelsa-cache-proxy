@@ -78,6 +78,15 @@ opposed to the ordinary data paths' TTL -1 (no time-based expiry). It is
 counted separately (`probe_sends`) so it never inflates or deflates the
 ordinary `cold_misses`/`warm_hits` data counters.
 
+The probe's own read is bounded to a couple of bytes, regardless of what
+the upstream actually sends: MINECRAFT-571 comment 55839 found the sibling
+WorldCover/JRC health checks doing an unbounded read before validating
+status/range, meaning a liveness check could end up downloading an entire
+multi-megabyte file if the origin ever ignored the probe's Range request.
+This endpoint uses a dedicated bounded fetch (`_health_probe`), separate
+from the ordinary data path's `_forward` (which legitimately needs the
+full body to validate and cache a real data read).
+
 The response is normalized to exactly **`200`** (healthy) or **`502`**
 (not healthy) — never the underlying fetch's raw status (a real success is
 actually `206`; CHELSA's native `404`/`403` mean missing/forbidden on that
@@ -214,4 +223,7 @@ access, no live provider) and exercise:
   file),
 - health-endpoint-supports-head (`HEAD /__health` matches
   `EarthStatus.reach()`'s plain HEAD probe: status only, no body; `HEAD`
-  on anything else is `404`).
+  on anything else is `404`),
+- health-probe-does-not-read-a-range-ignoring-whole-file (against a large
+  fixture file with Range ignored, the probe's connection closes long
+  before the whole body goes out, and the data cache stays untouched).

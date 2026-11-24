@@ -308,6 +308,33 @@ class ProxyTestCase(unittest.TestCase):
         status3 = _head(port, DEM_PATH)
         self.assertEqual(status3, 404)
 
+    def test_health_probe_does_not_read_a_range_ignoring_whole_file(self) -> None:
+        # MINECRAFT-571 55839 found the sibling WorldCover/JRC health
+        # checks doing an unbounded read before validating status/range —
+        # meaning a liveness check could download an entire multi-megabyte
+        # file. Prove this proxy's probe never does: against a large
+        # fixture file with Range ignored, the fake upstream should see the
+        # connection close long before the whole body goes out.
+        large = os.urandom(5 * 1024 * 1024)
+        upstream2 = FakeUpstream({DEM_PATH: large}).start()
+        self.addCleanup(upstream2.stop)
+        config = Config(
+            bind_host="127.0.0.1",
+            bind_port=0,
+            sqlite_path=os.path.join(self.tmpdir.name, "cache2.sqlite3"),
+            upstream_base=upstream2.base_url,
+        )
+        server = self._start_server(config)
+        port = server.server_address[1]
+
+        upstream2.ignore_range_next = True
+        status = _health(port)[0]
+        self.assertEqual(status, 200)
+        self.assertLess(upstream2.last_sent_bytes, len(large))
+        # And the data cache (a different Cache/SQLite file) was never
+        # touched by this probe either.
+        self.assertEqual(_stats(port)["cached_entries"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

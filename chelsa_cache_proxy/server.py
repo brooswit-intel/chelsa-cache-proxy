@@ -190,6 +190,50 @@ def _forward(config: Config, path: str, range_header: str, start: int, length: i
         return 0, b"", False
 
 
+# Bound on how many bytes the health probe will ever read, regardless of
+# what the upstream sends: the 1-byte request plus one extra byte is enough
+# to tell a well-behaved 206 apart from an origin that ignored Range and is
+# about to hand back the entire multi-megabyte DEM file. MINECRAFT-571
+# comment 55839 found exactly this gap (an unbounded read before
+# validation) on the sibling WorldCover/JRC lanes' own health checks.
+_HEALTH_PROBE_READ_CAP = 2
+
+
+def _health_probe(config: Config) -> int:
+    """A live reachability check against the fixed upstream, bounded to a
+    couple of bytes regardless of what the response actually contains or
+    claims to contain. Returns the real HTTP status, or 0 if no response
+    was ever received at all. Never reads the data cache, never writes to
+    it, and never risks reading an entire file into memory just to answer
+    "is it up" — status is checked and, on a real 2xx answer, only a
+    capped read follows (no unbounded ``resp.read()``).
+    """
+    base = urlsplit(config.upstream_base)
+    url = urlunsplit((base.scheme, base.netloc, base.path + HEALTH_PROBE_PATH, "", ""))
+    req = urllib.request.Request(
+        url,
+        headers={"Range": HEALTH_PROBE_RANGE, "User-Agent": "chelsa-cache-proxy/0.1"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=config.timeout_seconds) as resp:
+            status = resp.status
+            if status in (200, 206):
+                try:
+                    resp.read(_HEALTH_PROBE_READ_CAP)
+                except (http.client.HTTPException, OSError):
+                    pass
+            return status
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.read(_HEALTH_PROBE_READ_CAP)
+        except (http.client.HTTPException, OSError):
+            pass
+        return exc.code
+    except (urllib.error.URLError, OSError):
+        return 0
+
+
 def make_handler(cache: Cache, config: Config):
     locks_guard = threading.Lock()
     inflight: dict[str, threading.Lock] = {}
@@ -231,8 +275,14 @@ def make_handler(cache: Cache, config: Config):
             endpoint: a caller doing that check must have an exact "only
             200 means healthy" contract to check against. Matches the
             sibling elevation-cache-proxy's /__health contract.
+
+            Uses the bounded ``_health_probe`` rather than the ordinary
+            ``_forward`` used by the ``ALLOWED_PATHS`` data routes — see
+            55839: an unbounded read here would mean every liveness check
+            downloads the entire multi-megabyte DEM file if the upstream
+            ever ignores the probe's Range request.
             """
-            status, _body, _complete = _forward(config, HEALTH_PROBE_PATH, HEALTH_PROBE_RANGE, 0, 1)
+            status = _health_probe(config)
             cache.record_probe_send()
             return 200 if status in (200, 206) else 502
 
