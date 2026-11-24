@@ -69,6 +69,17 @@ opposed to the ordinary data paths' TTL -1 (no time-based expiry). It is
 counted separately (`probe_sends`) so it never inflates or deflates the
 ordinary `cold_misses`/`warm_hits` data counters.
 
+The response is normalized to exactly **`200`** (healthy) or **`502`**
+(not healthy) — never the underlying fetch's raw status (a real success is
+actually `206`; CHELSA's native `404`/`403` mean missing/forbidden on that
+byte range). This matters because a caller is expected to check for
+exactly `200`, not merely "anything below `500`" — MINECRAFT-571 comment
+55789 found the mod's `EarthStatus.reach()` doing exactly that loose check
+against a `/__health` endpoint, which would misread a `404`/`403` as
+healthy. This endpoint's contract is deliberately narrow so that mistake
+can't recur here: there is nothing but `200`/`502` to check against.
+Matches the sibling `elevation-cache-proxy`'s own `/__health` contract.
+
 ## Running it
 
 ```sh
@@ -176,4 +187,7 @@ access, no live provider) and exercise:
 - health-endpoint-fails-live-without-bypass-then-recovers (`/__health`
   against a down upstream fails live — no stale success — while the
   ordinary data cache stays warm through the same outage, and a
-  subsequent health check after the upstream recovers succeeds).
+  subsequent health check after the upstream recovers succeeds),
+- health-endpoint-never-leaks-a-non-5xx-status (a real, complete, non-2xx
+  upstream answer still normalizes to `502`, never passed through as
+  something a loose "status < 500" caller could misread as healthy).

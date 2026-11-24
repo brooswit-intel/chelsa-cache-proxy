@@ -215,12 +215,24 @@ def make_handler(cache: Cache, config: Config):
                 # direction, regardless of what Range a caller passes (the
                 # ordinary data path below never special-cases Range value
                 # at all — see the module docstring / MINECRAFT-571 55737).
-                status, body, _complete = _forward(config, HEALTH_PROBE_PATH, HEALTH_PROBE_RANGE)
+                #
+                # The response is normalized to exactly 200 (healthy) or 502
+                # (not healthy) — never the underlying fetch's raw status
+                # (206 on a real success, or CHELSA's native 404/403 for a
+                # missing/forbidden byte range). Per John's 55789 finding on
+                # EarthStatus.reach() accepting "anything below 500" as
+                # healthy against a probe endpoint: a caller doing that
+                # check must have an exact "only 200 means healthy" contract
+                # to check against, which means this endpoint must not leak
+                # a 404/403 that a loose caller would misread as healthy.
+                # Matches the sibling elevation-cache-proxy's /__health
+                # contract (its health_check(), same normalization).
+                status, _body, _complete = _forward(config, HEALTH_PROBE_PATH, HEALTH_PROBE_RANGE)
                 cache.record_probe_send()
-                if status == 0:
-                    self._respond_plain(502, b"upstream unreachable")
+                if status in (200, 206):
+                    self._respond_plain(200, b"")
                     return
-                self._respond_bytes(status, body)
+                self._respond_plain(502, b"upstream unreachable or unhealthy")
                 return
             if parsed.path not in ALLOWED_PATHS:
                 self._respond_plain(404, b"path not in the allowlisted CHELSA request set")

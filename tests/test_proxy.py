@@ -183,9 +183,11 @@ class ProxyTestCase(unittest.TestCase):
         server = self._start_server()
         port = server.server_address[1]
 
-        status, body = _health(port)
-        self.assertEqual(status, 206)
-        self.assertEqual(body, self.dem_bytes[0:1])
+        status, _body = _health(port)
+        # Normalized to exactly 200, never the underlying fetch's raw 206 —
+        # see the server.py comment / John's 55789 finding on a loose
+        # "anything below 500 is healthy" caller misreading a real 404/403.
+        self.assertEqual(status, 200)
         self.assertEqual(self.upstream.call_count, 1)
         self.assertEqual(_stats(port)["probe_sends"], 1)
         # The dedicated health endpoint must never satisfy, or be satisfied
@@ -196,7 +198,7 @@ class ProxyTestCase(unittest.TestCase):
 
         # A second probe still goes live (TTL 0 — never infinite freshness).
         status2, _ = _health(port)
-        self.assertEqual(status2, 206)
+        self.assertEqual(status2, 200)
         self.assertEqual(self.upstream.call_count, 2)
 
         # An ordinary data read for the exact same bytes is still cached as
@@ -229,9 +231,22 @@ class ProxyTestCase(unittest.TestCase):
         self.assertEqual(_stats(port)["warm_hits"], 1)
 
         self.upstream.down = False
-        status2, body2 = _health(port)
-        self.assertEqual(status2, 206)
-        self.assertEqual(body2, self.dem_bytes[0:1])
+        status2, _ = _health(port)
+        self.assertEqual(status2, 200)
+
+    def test_health_endpoint_never_leaks_a_non_5xx_upstream_status_as_healthy(self) -> None:
+        # A real, complete, non-2xx upstream answer (modeled here with the
+        # fake upstream's 503, but the point is any non-2xx) must still
+        # normalize to 502, not be passed through as something a loose
+        # "status < 500" caller (the exact bug in 55789) could misread as
+        # healthy.
+        server = self._start_server()
+        port = server.server_address[1]
+        self.upstream.fail_next = True
+        status, body = _health(port)
+        self.assertEqual(status, 502)
+        # Never the real upstream's own 503 body either.
+        self.assertNotIn(b"simulated upstream failure", body)
 
 
 if __name__ == "__main__":
