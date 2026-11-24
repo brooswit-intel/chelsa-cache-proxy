@@ -31,6 +31,15 @@ def _health(port: int) -> tuple[int, bytes]:
     return _get(port, "/__health", None)
 
 
+def _head(port: int, path: str) -> int:
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
 def _stats(port: int) -> dict:
     import json
 
@@ -275,6 +284,29 @@ class ProxyTestCase(unittest.TestCase):
         self.assertEqual(status2, 200)
         self.assertEqual(body2, self.dem_bytes[10:20])
         self.assertEqual(self.upstream.call_count, 1)
+
+    def test_health_endpoint_supports_head_matching_earthstatus_probe(self) -> None:
+        # EarthStatus.reach() sends a plain HEAD (no Range) to /__health —
+        # distinct from HostBackoff.check()'s GET Range:bytes=0-0 recovery
+        # probe against the data path itself (MINECRAFT-571 55816). Matches
+        # the fleet-wide /__health do_HEAD convention (55789/55808/55816/
+        # 55820).
+        server = self._start_server()
+        port = server.server_address[1]
+
+        status = _head(port, "/__health")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.upstream.call_count, 1)
+        self.assertEqual(_stats(port)["probe_sends"], 1)
+
+        self.upstream.down = True
+        status2 = _head(port, "/__health")
+        self.assertEqual(status2, 502)
+
+        # A HEAD on anything other than /__health is not a supported probe
+        # shape for this proxy.
+        status3 = _head(port, DEM_PATH)
+        self.assertEqual(status3, 404)
 
 
 if __name__ == "__main__":

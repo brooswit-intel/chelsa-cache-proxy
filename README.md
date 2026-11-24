@@ -62,6 +62,15 @@ Read directly from `io.earthplatform.geography.globe.ClimateSource` +
 
 ## Health endpoint
 
+Both `GET /__health` and `HEAD /__health` are supported — `HEAD` returns
+status only, no body, matching `EarthStatus.reach()`'s own plain HEAD
+probe (MINECRAFT-571 55789/55808/55816/55820). This is distinct from
+`HostBackoff.check()`'s recovery probe, which sends `GET` with
+`Range: bytes=0-0` directly against the data path itself (see "Native
+request contract" above and 55816) — `/__health` is not involved in that
+one at all. A `HEAD` on any other path is `404`; this proxy's data paths
+are never read with `HEAD`.
+
 `GET /__health` always makes one fresh live round trip to the real
 upstream (a 1-byte read of the fixed DEM file) and never reads from or
 writes to the data cache in either direction — TTL 0, explicitly, as
@@ -202,4 +211,7 @@ access, no live provider) and exercise:
 - upstream-ignoring-range-is-sliced-down (an origin that answers a Range
   request with a full `200` instead of `206` is sliced down to the exact
   requested range before caching, never cached or returned as the whole
-  file).
+  file),
+- health-endpoint-supports-head (`HEAD /__health` matches
+  `EarthStatus.reach()`'s plain HEAD probe: status only, no body; `HEAD`
+  on anything else is `404`).

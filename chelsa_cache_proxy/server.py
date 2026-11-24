@@ -216,32 +216,51 @@ def make_handler(cache: Cache, config: Config):
         def log_message(self, fmt, *args):  # noqa: D401 - silence default stderr logging
             pass
 
+        def _health_status(self) -> int:
+            """The dedicated TTL-0 probe: always a fresh live round trip,
+            never reads from or writes to the data cache in either
+            direction, regardless of what Range a caller passes (the
+            ordinary data path never special-cases Range value at all —
+            see the module docstring / MINECRAFT-571 55737).
+
+            Normalized to exactly 200 (healthy) or 502 (not healthy) —
+            never the underlying fetch's raw status (206 on a real
+            success, or CHELSA's native 404/403 for a missing/forbidden
+            byte range). Per John's 55789 finding on EarthStatus.reach()
+            accepting "anything below 500" as healthy against a probe
+            endpoint: a caller doing that check must have an exact "only
+            200 means healthy" contract to check against. Matches the
+            sibling elevation-cache-proxy's /__health contract.
+            """
+            status, _body, _complete = _forward(config, HEALTH_PROBE_PATH, HEALTH_PROBE_RANGE, 0, 1)
+            cache.record_probe_send()
+            return 200 if status in (200, 206) else 502
+
+        def do_HEAD(self) -> None:
+            # EarthStatus.reach()'s own health check sends a plain HEAD (no
+            # Range) to /__health, distinct from HostBackoff.check()'s GET
+            # Range:bytes=0-0 recovery probe against the data path itself
+            # (55816) — only /__health needs HEAD support. Status only, no
+            # body, per plain HTTP HEAD semantics (MINECRAFT-571 55789/
+            # 55808/55816/55820 — matches the fleet-wide /__health
+            # do_HEAD convention added across the other proxy lanes).
+            parsed = urlsplit(self.path)
+            if parsed.path != "/__health":
+                self._respond_plain(404, b"")
+                return
+            status = self._health_status()
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self) -> None:
             parsed = urlsplit(self.path)
             if parsed.path == "/_internal/stats":
                 self._respond_json(200, cache.stats() | {"attribution": ATTRIBUTION})
                 return
             if parsed.path == "/__health":
-                # Dedicated TTL-0 endpoint: always a fresh live round trip,
-                # never reads from or writes to the data cache in either
-                # direction, regardless of what Range a caller passes (the
-                # ordinary data path below never special-cases Range value
-                # at all — see the module docstring / MINECRAFT-571 55737).
-                #
-                # The response is normalized to exactly 200 (healthy) or 502
-                # (not healthy) — never the underlying fetch's raw status
-                # (206 on a real success, or CHELSA's native 404/403 for a
-                # missing/forbidden byte range). Per John's 55789 finding on
-                # EarthStatus.reach() accepting "anything below 500" as
-                # healthy against a probe endpoint: a caller doing that
-                # check must have an exact "only 200 means healthy" contract
-                # to check against, which means this endpoint must not leak
-                # a 404/403 that a loose caller would misread as healthy.
-                # Matches the sibling elevation-cache-proxy's /__health
-                # contract (its health_check(), same normalization).
-                status, _body, _complete = _forward(config, HEALTH_PROBE_PATH, HEALTH_PROBE_RANGE, 0, 1)
-                cache.record_probe_send()
-                if status in (200, 206):
+                status = self._health_status()
+                if status == 200:
                     self._respond_plain(200, b"")
                     return
                 self._respond_plain(502, b"upstream unreachable or unhealthy")
