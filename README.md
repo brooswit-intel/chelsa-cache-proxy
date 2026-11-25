@@ -154,8 +154,19 @@ Config is via environment variables, all optional:
   check and get cached under the wrong key (MINECRAFT-571 55866, found
   after the initial length-only fix in 55861). A missing or mismatched
   `Content-Range` is rejected before being trusted as a match, regardless
-  of length; the real (wrong) body is still forwarded through to the
-  client as-is, but is never written to the cache under this key.
+  of length.
+- **An invalid 200/206 is never forwarded to the client labeled as success,
+  either.** The real client (`RangeFiles.java`) accepts *any* `200`/`206`
+  as success without itself re-checking the range — it trusts this
+  proxy's status code completely. MINECRAFT-571 comment 55874 found that
+  the 55866 fix stopped *caching* an invalid response but was still
+  handing it to the client as a real `206`/`200`, which the client would
+  have silently accepted as correct data with no way to detect otherwise.
+  A `200`/`206` that fails this proxy's own validation is answered as
+  `502` instead (the same as "upstream unreachable") — never cached,
+  never labeled as success, always retryable. A real `404`/`403`/other
+  error status is still forwarded through unmodified, since the client's
+  own logic already knows what to do with those.
 - Every `206` response — cold or warm, sliced-from-200 or a real upstream
   `206` — carries a `Content-Range: bytes <start>-<end>/*` header computed
   from the request itself, so cold and warm replies for the same range
@@ -298,16 +309,14 @@ access, no live provider) and exercise:
   fixture file with Range ignored, the probe's connection closes long
   before the whole body goes out, and the data cache stays untouched),
 - declared-oversized-response-is-rejected-before-reading (a declared
-  Content-Length over the 64 MiB ceiling is rejected and never cached,
-  with the real status still forwarded through; a normal request right
-  after still works),
+  Content-Length over the 64 MiB ceiling is rejected and answered `502`,
+  never cached; a normal request right after still works),
 - 206-sends-matching-content-range-cold-and-warm and
   sliced-200-also-gets-a-matching-content-range (every successful data
   response — real 206 or sliced-200-reported-as-206 — carries a
   `Content-Range` identical across cold and warm replies),
 - 206-with-wrong-length-is-rejected-not-cached (a real 206 whose body
-  doesn't match the requested length is forwarded through as-is but never
-  cached),
+  doesn't match the requested length is answered `502`, never cached),
 - http-error-body-is-bounded (the error-response read is capped the same
   way a success response's is),
 - inflight-lock-map-does-not-grow-without-bound (the single-flight lock
@@ -315,7 +324,10 @@ access, no live provider) and exercise:
   rather than growing with every unique range ever seen),
 - 206-with-equal-length-wrong-offset-is-rejected-not-cached (a 206 whose
   Content-Range correctly names the wrong offsets it actually served is
-  rejected despite matching the requested length),
+  answered `502`, despite matching the requested length),
 - old-cache-schema-is-invalidated-on-open (a pre-migration database is
   wiped on open; a database already at the current version is not wiped
-  again on a later open).
+  again on a later open),
+- invalid-206-never-reaches-client-as-success-then-recovers (the
+  client-facing status/body for an invalid 206 is a real `502`, never a
+  mislabeled 206 with wrong bytes; a correct retry right after recovers).

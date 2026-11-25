@@ -363,8 +363,11 @@ class ProxyTestCase(unittest.TestCase):
         self.upstream.huge_content_length_next = True
 
         status, body = _get(port, DEM_PATH, "bytes=0-7")
-        self.assertEqual(status, 206)  # real status still forwarded through
-        self.assertEqual(body, b"")  # never the bogus body either
+        # Never forwarded as the real 206/200 — the real client trusts a
+        # 200/206 status completely without re-checking the range itself,
+        # so an invalid one must become a retryable failure instead
+        # (MINECRAFT-571 55874), not "success" with an empty/wrong body.
+        self.assertEqual(status, 502)
         self.assertEqual(_stats(port)["cached_entries"], 0)
 
         # Retryable: a normal request right after still works.
@@ -410,11 +413,10 @@ class ProxyTestCase(unittest.TestCase):
         self.upstream.wrong_length_206_next = True
 
         status, body = _get(port, DEM_PATH, "bytes=10-19")
-        self.assertEqual(status, 206)
-        # The real (wrongly sized) body is still forwarded through to the
-        # client as-is — this proxy does not invent a replacement body —
-        # but it must never be written to the cache under this key.
-        self.assertEqual(body, self.dem_bytes[10:20] + b"\x00")
+        # The real client trusts any 206 as success without re-checking
+        # the range itself, so an invalid one is never forwarded labeled
+        # as 206 — it becomes a retryable failure (MINECRAFT-571 55874).
+        self.assertEqual(status, 502)
         self.assertEqual(_stats(port)["cached_entries"], 0)
 
         # Retryable: a correct request right after still works and caches.
@@ -466,9 +468,11 @@ class ProxyTestCase(unittest.TestCase):
         self.upstream.wrong_offset_206_next = (20, 29)  # requested 10-19
 
         status, body = _get(port, DEM_PATH, "bytes=10-19")
-        self.assertEqual(status, 206)
-        # The real (wrong-range) body is still forwarded through as-is.
-        self.assertEqual(body, self.dem_bytes[20:30])
+        # The real client would accept any 206 as success without
+        # re-checking the offsets itself, so this must never be forwarded
+        # labeled 206 — it becomes a retryable failure instead
+        # (MINECRAFT-571 55874), not silently-wrong "success" data.
+        self.assertEqual(status, 502)
         self.assertEqual(_stats(port)["cached_entries"], 0)
 
         # Retryable: a correct request right after still works and caches.
@@ -517,6 +521,28 @@ class ProxyTestCase(unittest.TestCase):
             self.assertEqual(cache3.stats()["cached_entries"], 1)
         finally:
             cache3.close()
+
+    def test_invalid_206_never_reaches_client_as_success_then_recovers(self) -> None:
+        # MINECRAFT-571 55874: dff8835 stopped *caching* an invalid 206,
+        # but was still forwarding it to the client labeled 206 — and the
+        # real client (RangeFiles.java) accepts any 206 as success without
+        # itself re-checking the offsets, so it would have silently used
+        # wrong bytes. The client-facing status and body for exactly this
+        # case, plus recovery on the next (correct) request.
+        server = self._start_server()
+        port = server.server_address[1]
+        self.upstream.wrong_offset_206_next = (20, 29)  # requested 10-19
+
+        status, body = _get(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status, 502)
+        self.assertNotEqual(body, self.dem_bytes[10:20])
+        self.assertNotEqual(body, self.dem_bytes[20:30])
+        self.assertEqual(self.upstream.call_count, 1)
+
+        status2, body2 = _get(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, self.dem_bytes[10:20])
+        self.assertEqual(self.upstream.call_count, 2)
 
 
 if __name__ == "__main__":

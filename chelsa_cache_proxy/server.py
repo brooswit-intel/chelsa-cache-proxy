@@ -439,6 +439,21 @@ def make_handler(cache: Cache, config: Config):
             if status == 0:
                 self._respond_plain(502, b"upstream unreachable")
                 return
+            if status in (200, 206):
+                # The real client (RangeFiles.java) accepts ANY 200/206 as
+                # success without itself re-checking the range — it trusts
+                # this proxy's status code completely. 55870 found that
+                # forwarding an invalid-but-200/206 response through as
+                # "success" hands the client wrong bytes it has no way to
+                # detect on its own (MINECRAFT-571 55874). A 200/206 that
+                # failed this proxy's own validation must never reach the
+                # client labeled as success — it becomes a retryable
+                # failure instead, exactly like "upstream unreachable".
+                self._respond_plain(502, b"invalid upstream range response")
+                return
+            # A real 404/403/5xx/etc. is forwarded through unmodified — the
+            # client's own logic already knows what to do with those
+            # (missing-vs-transient for 404/403, retry for anything else).
             self._respond_bytes(status, body, content_range)
 
         def _respond_bytes(self, status: int, body: bytes, content_range: str | None = None) -> None:
