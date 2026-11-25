@@ -43,9 +43,19 @@ Read directly from `io.earthplatform.geography.globe.ClimateSource` +
   - `input/dem_geo.sdat`
 - `404`/`403` mean "this row/file is genuinely missing" to the real
   client, and are never retried as transient; `200`/`206` mean success.
-  This proxy forwards status and body through unmodified so the client
-  keeps making that distinction itself — it does not reinterpret one as
-  the other.
+  This proxy forwards `404`/`403` status and body through unmodified so
+  the client keeps making that distinction itself.
+- **This proxy always reports a successful data read as `206`, never
+  `200`.** The real client (`RangeFiles.java`) has its own defensive
+  re-slicing logic that triggers only on a raw `200` (`if (status == 200
+  && (offset != 0 || body.length > length)) body =
+  Arrays.copyOfRange(...)`). An earlier revision of this proxy sliced an
+  origin's Range-ignoring `200` down to the requested bytes but kept
+  reporting `200` — the real client then sliced the *already-sliced*
+  body a second time at its own original absolute offset, producing an
+  empty array even from a warm proxy cache (MINECRAFT-571 comment
+  55861). Reporting `206` tells the client the body is already exactly
+  what it asked for.
 - A dedicated reachability probe (`HostBackoff.check`) sends
   `GET <path>` with exactly `Range: bytes=0-0` against whichever file URI
   the host is currently failing on. **This proxy does not special-case that
@@ -133,14 +143,35 @@ Config is via environment variables, all optional:
   that didn't — this proxy slices the body down to the exact requested
   `[start, start+length)` range itself before caching or returning
   anything, so a small-range request can never cache (or return) an
-  entire multi-megabyte file under one byte-range cache key.
+  entire multi-megabyte file under one byte-range cache key. The reported
+  status is normalized to `206` (see "Native request contract" above),
+  never left as `200`.
+- A real `206` is validated against the length actually *requested*, not
+  merely against its own declared `Content-Length` — a `206` that answers
+  with the wrong range (same declared and delivered length, just the
+  wrong bytes) is still forwarded through to the client as-is, but is
+  never written to the cache under this key (MINECRAFT-571 55861).
+- Every `206` response — cold or warm, sliced-from-200 or a real upstream
+  `206` — carries a `Content-Range: bytes <start>-<end>/*` header computed
+  from the request itself, so cold and warm replies for the same range
+  are trivially identical (the total length after `/` is unknown to this
+  proxy, which never reads a whole file, hence `*`).
 - The ordinary data path never inspects the Range *value* to decide
   cacheability — a `bytes=0-0` data request is cached exactly like any
   other range. The TTL-0, always-live behavior lives only in the separate
   `/__health` endpoint (see above).
 - Concurrent identical-range misses are deduplicated (single-flight): N
   simultaneous requests for the same uncached range produce exactly one
-  upstream send, and every waiter gets that one result.
+  upstream send, and every waiter gets that one result. The lock map
+  entry for a key is removed as soon as no thread is using it — CHELSA's
+  addressable range space is effectively unbounded (every distinct row/
+  header ever read is its own key), so keeping one lock per key ever
+  seen, rather than per key currently in flight, would grow without bound
+  over a long-running process (MINECRAFT-571 55861).
+- A real (non-"never reached the upstream") error response's body is
+  bounded the same way a success response's is (`_MAX_FORWARD_BYTES`) —
+  the `HTTPError` branch's read was previously unbounded, the same risk
+  shape as the success path (55861).
 - The cache is bounded (`PROXY_MAX_CACHE_BYTES`); exceeding it evicts the
   least-recently-accessed entries, not a blanket flush.
 - A single forwarded response — declared or actually delivered — over
@@ -186,6 +217,17 @@ confirmed: the real upstream's exact behavior on a malformed/out-of-range
 request, and its actual rate-limit/5xx shape under sustained load — this
 slice's retry/backoff behavior has only been exercised against the local
 `tests/fake_upstream.py`, never the live object store.
+
+## Cache migration
+
+On open, the cache purges any stored entry with `status = 200`
+(`DELETE FROM entries WHERE status = 200`). Under the current contract no
+entry is ever written with `status` `200` — a sliced success is always
+normalized to `206` (see "Native request contract" above) — so a `200`
+row can only be a leftover from the earlier, incompatible prototype
+behavior, which a real client would double-slice into an empty or wrong
+body (MINECRAFT-571 55861). This runs on every `Cache(...)` construction;
+it is a no-op once no such rows remain.
 
 ## Security notes
 
@@ -240,4 +282,16 @@ access, no live provider) and exercise:
 - declared-oversized-response-is-rejected-before-reading (a declared
   Content-Length over the 64 MiB ceiling is rejected and never cached,
   with the real status still forwarded through; a normal request right
-  after still works).
+  after still works),
+- 206-sends-matching-content-range-cold-and-warm and
+  sliced-200-also-gets-a-matching-content-range (every successful data
+  response — real 206 or sliced-200-reported-as-206 — carries a
+  `Content-Range` identical across cold and warm replies),
+- 206-with-wrong-length-is-rejected-not-cached (a real 206 whose body
+  doesn't match the requested length is forwarded through as-is but never
+  cached),
+- http-error-body-is-bounded (the error-response read is capped the same
+  way a success response's is),
+- inflight-lock-map-does-not-grow-without-bound (the single-flight lock
+  map's size stays at zero between requests across many distinct ranges,
+  rather than growing with every unique range ever seen).

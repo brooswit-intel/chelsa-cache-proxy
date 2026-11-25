@@ -157,14 +157,24 @@ def _forward(config: Config, path: str, range_header: str, start: int, length: i
       success: a non-200/206 status, or a declared length that the actually
       delivered body didn't match (a genuine mid-transfer truncation).
     - On a real ``200`` (the upstream ignored the Range request and
-      returned the whole file — CHELSA's own client defends against
-      exactly this in ``RangeFiles.java``: ``if (status == 200 && (offset
-      != 0 || body.length > length)) body = Arrays.copyOfRange(...)``, and
-      the sibling MINECRAFT-573/JRC lane's review found the same shape of
-      bug, MINECRAFT-581), ``body`` is sliced down to ``[start, start +
-      length)`` here before the caller ever sees it, so a small-range
-      request can never cache (or return) an entire multi-megabyte file
-      under one byte-range cache key.
+      returned the whole file), ``body`` is sliced down to
+      ``[start, start + length)`` here before the caller ever sees it, so
+      a small-range request can never cache (or return) an entire
+      multi-megabyte file under one byte-range cache key — AND the
+      reported ``status`` is normalized to ``206``, never left as ``200``.
+      MINECRAFT-571 comment 55861 found that an earlier revision sliced
+      the body but kept reporting ``200``: the real client's own
+      ``RangeFiles.java`` has identical defensive logic
+      (``if (status == 200 && (offset != 0 || body.length > length)) body
+      = Arrays.copyOfRange(...)``) that re-slices *again* on seeing a raw
+      ``200`` — double-slicing an already-sliced 10-byte body at its own
+      original absolute offset produced an empty array even from a warm
+      proxy cache. Reporting ``206`` tells the real client the body is
+      already exactly what it asked for, so it never re-slices.
+    - A real ``206`` is validated against the *requested* length, not just
+      its own declared ``Content-Length`` — a ``206`` whose delivered body
+      doesn't match the length actually asked for (serving the wrong
+      range) must not be cached as if it were a match for this cache key.
     - A declared or actually-delivered body over ``_MAX_FORWARD_BYTES`` is
       never fully buffered: the real DEM file is the whole global raw-float
       grid (tens of GiB) and the GeoTIFF files are each hundreds of MB —
@@ -194,16 +204,33 @@ def _forward(config: Config, path: str, range_header: str, start: int, length: i
             if len(raw) > _MAX_FORWARD_BYTES:
                 return resp.status, b"", False
             complete = expected_length is None or len(raw) == int(expected_length)
-            if resp.status == 200 and complete and (start != 0 or len(raw) > length):
-                raw = raw[start:start + length]
+            status = resp.status
+            if status == 200 and complete:
+                if start != 0 or len(raw) > length:
+                    raw = raw[start:start + length]
+                # Always report this as 206: it is now exactly the
+                # requested slice, and a raw 200 would make a real
+                # RangeFiles-style client re-slice an already-sliced body
+                # at its original absolute offset (55861).
+                status = 206
                 complete = len(raw) == length
-            return resp.status, raw, complete
+            elif status == 206:
+                # A 206 is only a match for this cache key if it actually
+                # delivered the length that was asked for, not merely a
+                # length consistent with its own declared Content-Length.
+                complete = complete and len(raw) == length
+            return status, raw, complete
     except urllib.error.HTTPError as exc:
         # 404/403 land here too: a real, complete answer from the upstream,
         # just not a 2xx one. Never cached as success; the status is
         # forwarded through unmodified so the client keeps making its own
-        # missing-vs-transient distinction.
-        return exc.code, exc.read(), False
+        # missing-vs-transient distinction. Body is bounded the same as a
+        # success response (55861) — an error body has no reason to be
+        # huge, but nothing stops a misbehaving upstream from sending one.
+        body = exc.read(_MAX_FORWARD_BYTES + 1)
+        if len(body) > _MAX_FORWARD_BYTES:
+            body = b""
+        return exc.code, body, False
     except (urllib.error.URLError, OSError):
         # Covers both "never connected at all" (URLError: refused/DNS/
         # timeout before any bytes) and "connected but the peer dropped us
@@ -258,23 +285,37 @@ def _health_probe(config: Config) -> int:
 
 def make_handler(cache: Cache, config: Config):
     locks_guard = threading.Lock()
-    inflight: dict[str, threading.Lock] = {}
+    # Keyed by exact (path, byte range) — CHELSA's addressable range space
+    # is effectively unbounded (every distinct row/header/chunk ever read
+    # is its own key), so a lock entry per key ever seen would grow without
+    # bound over a long-running process (MINECRAFT-571 55861). Each entry
+    # is [Lock, waiter_count]; it is removed as soon as no thread is still
+    # using it, so the dict's size is bounded by concurrency, not by how
+    # many distinct ranges have ever been requested.
+    inflight: dict[str, list] = {}
 
     def singleflight_fetch(key: str, path: str, range_header: str, start: int, length: int):
         with locks_guard:
-            lock = inflight.setdefault(key, threading.Lock())
-        with lock:
-            cached = cache.get(key)
-            if cached is not None:
-                return "warm", cached.status, cached.body
-            status, body, complete = _forward(config, path, range_header, start, length)
-            if status in (200, 206) and complete:
-                cache.put(key, CachedRange(status=status, body=body))
-                return "cold", status, body
-            return "uncached", status, body
-        # Lock is released; stale per-path lock objects are intentionally
-        # left in the dict (bounded by the 5 allowlisted paths, not by
-        # request volume) rather than torn down under a race.
+            entry = inflight.get(key)
+            if entry is None:
+                entry = [threading.Lock(), 0]
+                inflight[key] = entry
+            entry[1] += 1
+        try:
+            with entry[0]:
+                cached = cache.get(key)
+                if cached is not None:
+                    return "warm", cached.status, cached.body
+                status, body, complete = _forward(config, path, range_header, start, length)
+                if status in (200, 206) and complete:
+                    cache.put(key, CachedRange(status=status, body=body))
+                    return "cold", status, body
+                return "uncached", status, body
+        finally:
+            with locks_guard:
+                entry[1] -= 1
+                if entry[1] == 0 and inflight.get(key) is entry:
+                    del inflight[key]
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "chelsa-cache-proxy/0.1"
@@ -349,13 +390,19 @@ def make_handler(cache: Cache, config: Config):
 
             key = Cache.key(parsed.path, start, end)
             outcome, status, body = singleflight_fetch(key, parsed.path, range_header, start, end - start + 1)
+            # A matching Content-Range is sent on every 206, cold or warm
+            # alike (55861) — computed from the request itself, not stored
+            # per entry, so cold and warm replies are trivially consistent
+            # with each other by construction. Total length is unknown to
+            # this proxy (it never reads a whole file), hence "*".
+            content_range = f"bytes {start}-{end}/*" if status == 206 else None
             if outcome == "warm":
                 cache.record_warm_hit()
-                self._respond_bytes(status, body)
+                self._respond_bytes(status, body, content_range)
                 return
             if outcome == "cold":
                 cache.record_cold_miss()
-                self._respond_bytes(status, body)
+                self._respond_bytes(status, body, content_range)
                 return
             # uncached: error, transient failure, or truncated — never
             # stored, always retryable on the next request.
@@ -363,12 +410,14 @@ def make_handler(cache: Cache, config: Config):
             if status == 0:
                 self._respond_plain(502, b"upstream unreachable")
                 return
-            self._respond_bytes(status, body)
+            self._respond_bytes(status, body, content_range)
 
-        def _respond_bytes(self, status: int, body: bytes) -> None:
+        def _respond_bytes(self, status: int, body: bytes, content_range: str | None = None) -> None:
             self.send_response(status)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
+            if content_range is not None:
+                self.send_header("Content-Range", content_range)
             self.end_headers()
             self.wfile.write(body)
 
@@ -389,6 +438,11 @@ def make_handler(cache: Cache, config: Config):
             self.end_headers()
             self.wfile.write(body)
 
+    # Exposed for tests to confirm the single-flight lock map's size is
+    # bounded by in-flight requests, not by how many distinct ranges have
+    # ever been requested (MINECRAFT-571 55861) — not used by request
+    # handling itself.
+    Handler.inflight = inflight
     return Handler
 
 

@@ -27,6 +27,17 @@ def _get(port: int, path: str, range_header: str | None) -> tuple[int, bytes]:
         return exc.code, exc.read()
 
 
+def _get_with_headers(port: int, path: str, range_header: str | None) -> tuple[int, bytes, dict]:
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="GET")
+    if range_header is not None:
+        req.add_header("Range", range_header)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read(), dict(resp.headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), dict(exc.headers or {})
+
+
 def _health(port: int) -> tuple[int, bytes]:
     return _get(port, "/__health", None)
 
@@ -264,12 +275,19 @@ class ProxyTestCase(unittest.TestCase):
         # a proxy that didn't handle this and mis-accounted bytes as a
         # result. Prove this proxy slices such a response down to the
         # requested range before ever caching or returning it.
+        #
+        # The reported status must be 206, not 200 (MINECRAFT-571 55861):
+        # an earlier revision sliced the body but kept reporting 200, which
+        # made the real client's own defensive re-slicing logic (triggered
+        # only by a raw 200) slice an already-10-byte body a second time
+        # at its original absolute offset, producing an empty array even
+        # from a warm proxy cache.
         server = self._start_server()
         port = server.server_address[1]
         self.upstream.ignore_range_next = True
 
         status, body = _get(port, DEM_PATH, "bytes=10-19")
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 206)
         self.assertEqual(body, self.dem_bytes[10:20])
         self.assertEqual(len(body), 10)
 
@@ -279,9 +297,9 @@ class ProxyTestCase(unittest.TestCase):
         self.assertEqual(stats["cached_bytes"], 10)
 
         # A repeat of the same small range is served warm with that same
-        # 10-byte slice, not the 1024-byte whole file.
+        # 10-byte slice, not the 1024-byte whole file, and the same status.
         status2, body2 = _get(port, DEM_PATH, "bytes=10-19")
-        self.assertEqual(status2, 200)
+        self.assertEqual(status2, 206)
         self.assertEqual(body2, self.dem_bytes[10:20])
         self.assertEqual(self.upstream.call_count, 1)
 
@@ -353,6 +371,90 @@ class ProxyTestCase(unittest.TestCase):
         status2, body2 = _get(port, DEM_PATH, "bytes=0-7")
         self.assertEqual(status2, 206)
         self.assertEqual(body2, self.dem_bytes[0:8])
+
+    def test_206_sends_matching_content_range_cold_and_warm(self) -> None:
+        # MINECRAFT-571 55861: Content-Range was previously omitted
+        # entirely on 206 responses. It must be present and identical on
+        # both the cold (upstream) and warm (cache) reply for the same
+        # request.
+        server = self._start_server()
+        port = server.server_address[1]
+
+        status, body, headers = _get_with_headers(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.dem_bytes[10:20])
+        self.assertEqual(headers.get("Content-Range"), "bytes 10-19/*")
+
+        status2, body2, headers2 = _get_with_headers(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, self.dem_bytes[10:20])
+        self.assertEqual(headers2.get("Content-Range"), headers.get("Content-Range"))
+
+    def test_sliced_200_also_gets_a_matching_content_range(self) -> None:
+        server = self._start_server()
+        port = server.server_address[1]
+        self.upstream.ignore_range_next = True
+
+        status, body, headers = _get_with_headers(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.dem_bytes[10:20])
+        self.assertEqual(headers.get("Content-Range"), "bytes 10-19/*")
+
+    def test_206_with_wrong_length_is_rejected_not_cached(self) -> None:
+        # A real 206 whose own declared Content-Length matches its own
+        # (wrongly sized) body passes ordinary truncation checking — only
+        # validating against the length actually requested catches this
+        # (MINECRAFT-571 55861).
+        server = self._start_server()
+        port = server.server_address[1]
+        self.upstream.wrong_length_206_next = True
+
+        status, body = _get(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status, 206)
+        # The real (wrongly sized) body is still forwarded through to the
+        # client as-is — this proxy does not invent a replacement body —
+        # but it must never be written to the cache under this key.
+        self.assertEqual(body, self.dem_bytes[10:20] + b"\x00")
+        self.assertEqual(_stats(port)["cached_entries"], 0)
+
+        # Retryable: a correct request right after still works and caches.
+        status2, body2 = _get(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, self.dem_bytes[10:20])
+        self.assertEqual(_stats(port)["cached_entries"], 1)
+
+    def test_http_error_body_is_bounded(self) -> None:
+        # The HTTPError branch's exc.read() was previously unbounded, same
+        # risk shape as the success path (MINECRAFT-571 55861).
+        server = self._start_server()
+        port = server.server_address[1]
+        self.upstream.fail_next = True
+        status, body = _get(port, DEM_PATH, "bytes=0-7")
+        self.assertEqual(status, 503)
+        # The real (small) error body is still delivered when under the cap.
+        self.assertIn(b"simulated upstream failure", body)
+
+    def test_inflight_lock_map_does_not_grow_without_bound(self) -> None:
+        # MINECRAFT-571 55861: a lock entry per distinct (path, range) key
+        # ever requested would grow without bound over a long-running
+        # process, since CHELSA's addressable range space is effectively
+        # unbounded. Each entry must be removed once no thread is using it.
+        server = self._start_server()
+        port = server.server_address[1]
+        inflight = server.RequestHandlerClass.inflight
+        self.assertEqual(len(inflight), 0)
+
+        for start in range(0, 200, 8):
+            end = min(start + 7, len(self.dem_bytes) - 1)
+            status, body = _get(port, DEM_PATH, f"bytes={start}-{end}")
+            self.assertEqual(status, 206)
+            self.assertEqual(body, self.dem_bytes[start:end + 1])
+            # Resolved sequentially: never more than the one just finished
+            # still lingering, and none left over once this call returns.
+            self.assertEqual(len(inflight), 0)
+
+        self.assertEqual(self.upstream.call_count, 25)
+        self.assertEqual(len(inflight), 0)
 
 
 if __name__ == "__main__":

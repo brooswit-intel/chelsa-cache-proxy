@@ -60,6 +60,14 @@ class Cache:
                 "INSERT OR IGNORE INTO counters (name, value) VALUES (?, 0)",
                 (name,),
             )
+        # A cached entry is never stored with status 200 under the current
+        # contract (server.py always normalizes a sliced success to 206 —
+        # see MINECRAFT-571 55861). An entry with status 200 can only be a
+        # leftover from the earlier, incompatible prototype behavior that
+        # kept 200 after slicing, which a real RangeFiles-style client
+        # would double-slice into an empty/wrong body. Purge any such rows
+        # on open rather than ever risk serving one.
+        self._conn.execute("DELETE FROM entries WHERE status = 200")
         self._conn.commit()
 
     @staticmethod

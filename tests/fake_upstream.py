@@ -42,6 +42,12 @@ class FakeUpstream:
         # proxy's defensive ceiling, to prove it's rejected before any
         # read is attempted (not just after a slow full download).
         self.huge_content_length_next = False
+        # Serves a real 206 whose body is a different length than the
+        # requested range (its own declared Content-Length matches its own
+        # — wrongly sized — body, so the ordinary truncation check alone
+        # wouldn't catch this; only validating against the *requested*
+        # length does, per MINECRAFT-571 55861).
+        self.wrong_length_206_next = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -109,6 +115,9 @@ class FakeUpstream:
                 start_s, _, end_s = range_header[len("bytes="):].partition("-")
                 start, end = int(start_s), int(end_s)
                 body = content[start:end + 1]
+                if outer.wrong_length_206_next:
+                    outer.wrong_length_206_next = False
+                    body = body + b"\x00"  # one byte too many, still a real 206
                 self.send_response(206)
                 self.send_header("Content-Type", "application/octet-stream")
                 self.send_header("Content-Length", str(len(body)))
