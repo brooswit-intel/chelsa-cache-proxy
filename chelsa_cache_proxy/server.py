@@ -89,6 +89,23 @@ class RangeNotSatisfiable(Exception):
     pass
 
 
+def _parse_content_range_endpoints(header: str | None) -> tuple[int, int] | None:
+    """Parses a response ``Content-Range: bytes <start>-<end>/<total-or-*>``
+    header and returns its ``(start, end)`` endpoints, or ``None`` if the
+    header is missing or not in that exact shape. Does not look at the
+    ``/<total-or-*>`` part — only the endpoints matter for verifying a 206
+    actually answers the range that was requested.
+    """
+    if not header or not header.startswith("bytes "):
+        return None
+    range_part = header[len("bytes "):].split("/", 1)[0]
+    start_s, _, end_s = range_part.partition("-")
+    try:
+        return int(start_s), int(end_s)
+    except ValueError:
+        return None
+
+
 def _parse_range(header: str | None) -> tuple[int, int]:
     """Parses ``bytes=<start>-<end>`` (end inclusive). Raises RangeNotSatisfiable
     for anything else — CHELSA's own client never sends a suffix range, an
@@ -171,10 +188,14 @@ def _forward(config: Config, path: str, range_header: str, start: int, length: i
       original absolute offset produced an empty array even from a warm
       proxy cache. Reporting ``206`` tells the real client the body is
       already exactly what it asked for, so it never re-slices.
-    - A real ``206`` is validated against the *requested* length, not just
-      its own declared ``Content-Length`` — a ``206`` whose delivered body
-      doesn't match the length actually asked for (serving the wrong
-      range) must not be cached as if it were a match for this cache key.
+    - A real ``206`` is validated against both the *requested* length and
+      the upstream's own ``Content-Range`` response endpoints, not just
+      its declared ``Content-Length``. Length alone is not enough:
+      MINECRAFT-571 comment 55866 found that an equal-length,
+      wrong-offset 206 (answering ``bytes=10-19`` with ``bytes 20-29`` of
+      the same length) would still pass a length-only check and get
+      cached under the wrong key. A missing or mismatched ``Content-Range``
+      is rejected before being trusted as a match, regardless of length.
     - A declared or actually-delivered body over ``_MAX_FORWARD_BYTES`` is
       never fully buffered: the real DEM file is the whole global raw-float
       grid (tens of GiB) and the GeoTIFF files are each hundreds of MB —
@@ -215,10 +236,18 @@ def _forward(config: Config, path: str, range_header: str, start: int, length: i
                 status = 206
                 complete = len(raw) == length
             elif status == 206:
-                # A 206 is only a match for this cache key if it actually
-                # delivered the length that was asked for, not merely a
-                # length consistent with its own declared Content-Length.
-                complete = complete and len(raw) == length
+                # A 206 is only a match for this cache key if it both
+                # delivered the requested length AND its own Content-Range
+                # response header names the exact endpoints that were
+                # asked for. Length alone is not enough: MINECRAFT-571
+                # comment 55866 found that an equal-length, wrong-offset
+                # 206 (e.g. answering bytes=10-19 with bytes 20-29 of the
+                # same length) would still pass a length-only check and be
+                # cached under the wrong key. A missing or mismatched
+                # Content-Range means this is rejected before being
+                # trusted as a match, regardless of body length.
+                endpoints = _parse_content_range_endpoints(resp.headers.get("Content-Range"))
+                complete = complete and len(raw) == length and endpoints == (start, start + length - 1)
             return status, raw, complete
     except urllib.error.HTTPError as exc:
         # 404/403 land here too: a real, complete answer from the upstream,

@@ -48,6 +48,11 @@ class FakeUpstream:
         # wouldn't catch this; only validating against the *requested*
         # length does, per MINECRAFT-571 55861).
         self.wrong_length_206_next = False
+        # Serves a real 206 with the CORRECT requested length but the
+        # WRONG actual bytes (and a Content-Range header naming the real,
+        # wrong offsets it served) -- the exact "equal-length, wrong-offset"
+        # case MINECRAFT-571 comment 55866 found was not being checked.
+        self.wrong_offset_206_next: tuple[int, int] | None = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -115,6 +120,21 @@ class FakeUpstream:
                 start_s, _, end_s = range_header[len("bytes="):].partition("-")
                 start, end = int(start_s), int(end_s)
                 body = content[start:end + 1]
+
+                if outer.wrong_offset_206_next is not None:
+                    wrong_start, wrong_end = outer.wrong_offset_206_next
+                    outer.wrong_offset_206_next = None
+                    body = content[wrong_start:wrong_end + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header(
+                        "Content-Range", f"bytes {wrong_start}-{wrong_end}/{len(content)}"
+                    )
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
                 if outer.wrong_length_206_next:
                     outer.wrong_length_206_next = False
                     body = body + b"\x00"  # one byte too many, still a real 206

@@ -146,11 +146,16 @@ Config is via environment variables, all optional:
   entire multi-megabyte file under one byte-range cache key. The reported
   status is normalized to `206` (see "Native request contract" above),
   never left as `200`.
-- A real `206` is validated against the length actually *requested*, not
-  merely against its own declared `Content-Length` — a `206` that answers
-  with the wrong range (same declared and delivered length, just the
-  wrong bytes) is still forwarded through to the client as-is, but is
-  never written to the cache under this key (MINECRAFT-571 55861).
+- A real `206` is validated against **both** the length actually
+  *requested* and the upstream's own `Content-Range` response endpoints —
+  not merely against its declared `Content-Length`. Length alone is not
+  enough: an equal-length, wrong-offset `206` (answering `bytes=10-19`
+  with `bytes 20-29` of the same length) would still pass a length-only
+  check and get cached under the wrong key (MINECRAFT-571 55866, found
+  after the initial length-only fix in 55861). A missing or mismatched
+  `Content-Range` is rejected before being trusted as a match, regardless
+  of length; the real (wrong) body is still forwarded through to the
+  client as-is, but is never written to the cache under this key.
 - Every `206` response — cold or warm, sliced-from-200 or a real upstream
   `206` — carries a `Content-Range: bytes <start>-<end>/*` header computed
   from the request itself, so cold and warm replies for the same range
@@ -220,14 +225,27 @@ slice's retry/backoff behavior has only been exercised against the local
 
 ## Cache migration
 
-On open, the cache purges any stored entry with `status = 200`
-(`DELETE FROM entries WHERE status = 200`). Under the current contract no
-entry is ever written with `status` `200` — a sliced success is always
-normalized to `206` (see "Native request contract" above) — so a `200`
-row can only be a leftover from the earlier, incompatible prototype
-behavior, which a real client would double-slice into an empty or wrong
-body (MINECRAFT-571 55861). This runs on every `Cache(...)` construction;
-it is a no-op once no such rows remain.
+The cache carries a `SCHEMA_VERSION` in a `meta` table. Opening a database
+whose stored version is older wipes every existing entry — there is no
+way to tell, after the fact, which of an old database's rows were written
+under a correctness check that didn't exist yet, so none of them can be
+trusted (MINECRAFT-571 55866: the Content-Range endpoint check was added
+*after* the length-only check in 55861, meaning rows written in between
+could already contain a silently wrong-offset entry). Bumped versions:
+
+- **2** — the Content-Range endpoint validation (55866) landed; every
+  pre-existing row predates it.
+
+On top of that, open also purges any stored entry with `status = 200`
+(`DELETE FROM entries WHERE status = 200`) — under the current contract no
+entry is ever written with status `200` (a sliced success is always
+normalized to `206`, see "Native request contract" above), so a `200` row
+can only be an incompatible leftover from the earlier prototype behavior
+that a real client would double-slice into an empty or wrong body
+(MINECRAFT-571 55861). This is redundant with the version-bump wipe today
+but is kept as defense in depth against a future dev/test database that
+got entries written outside this schema's own migration path. Both run on
+every `Cache(...)` construction and are no-ops once no such rows remain.
 
 ## Security notes
 
@@ -294,4 +312,10 @@ access, no live provider) and exercise:
   way a success response's is),
 - inflight-lock-map-does-not-grow-without-bound (the single-flight lock
   map's size stays at zero between requests across many distinct ranges,
-  rather than growing with every unique range ever seen).
+  rather than growing with every unique range ever seen),
+- 206-with-equal-length-wrong-offset-is-rejected-not-cached (a 206 whose
+  Content-Range correctly names the wrong offsets it actually served is
+  rejected despite matching the requested length),
+- old-cache-schema-is-invalidated-on-open (a pre-migration database is
+  wiped on open; a database already at the current version is not wiped
+  again on a later open).

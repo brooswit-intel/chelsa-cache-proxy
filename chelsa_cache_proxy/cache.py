@@ -36,6 +36,17 @@ class Cache:
 
     COUNTER_NAMES = ("cold_misses", "warm_hits", "probe_sends")
 
+    # Bump this whenever a past bug could have written an entry this
+    # version's code would not trust — e.g. MINECRAFT-571 55866 found that
+    # a 206 was accepted and cached solely because its body length matched
+    # the request, without checking the upstream's own Content-Range
+    # endpoints actually matched too (an equal-length, wrong-offset 206
+    # would have been silently cached under the wrong key). Existing rows
+    # from before that check existed cannot be retroactively verified, so
+    # a version bump wipes all of them rather than leaving unverified data
+    # in place — a one-time invalidation, not an ongoing migration scheme.
+    SCHEMA_VERSION = 2
+
     def __init__(self, path: str, max_bytes: int = 2 << 30) -> None:
         self._lock = threading.Lock()
         self._max_bytes = max_bytes
@@ -55,10 +66,28 @@ class Cache:
             " value INTEGER NOT NULL"
             ")"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta ("
+            " key TEXT PRIMARY KEY,"
+            " value TEXT NOT NULL"
+            ")"
+        )
         for name in self.COUNTER_NAMES:
             self._conn.execute(
                 "INSERT OR IGNORE INTO counters (name, value) VALUES (?, 0)",
                 (name,),
+            )
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        stored_version = int(row[0]) if row is not None else 0
+        if stored_version < self.SCHEMA_VERSION:
+            # Every existing entry predates a correctness check this
+            # version relies on — none of them can be trusted retroactively.
+            self._conn.execute("DELETE FROM entries")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+                (str(self.SCHEMA_VERSION),),
             )
         # A cached entry is never stored with status 200 under the current
         # contract (server.py always normalizes a sliced success to 206 —
@@ -66,7 +95,10 @@ class Cache:
         # leftover from the earlier, incompatible prototype behavior that
         # kept 200 after slicing, which a real RangeFiles-style client
         # would double-slice into an empty/wrong body. Purge any such rows
-        # on open rather than ever risk serving one.
+        # on open rather than ever risk serving one — redundant with the
+        # version-bump wipe above today, but kept as defense in depth
+        # against a future dev/test DB that got entries written outside
+        # this schema's own migration path.
         self._conn.execute("DELETE FROM entries WHERE status = 200")
         self._conn.commit()
 

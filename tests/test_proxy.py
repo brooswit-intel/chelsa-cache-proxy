@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 
 from chelsa_cache_proxy.server import Config, ProxyServer
-from chelsa_cache_proxy.cache import Cache
+from chelsa_cache_proxy.cache import Cache, CachedRange
 
 from fake_upstream import FakeUpstream
 
@@ -455,6 +455,68 @@ class ProxyTestCase(unittest.TestCase):
 
         self.assertEqual(self.upstream.call_count, 25)
         self.assertEqual(len(inflight), 0)
+
+    def test_206_with_equal_length_wrong_offset_is_rejected_not_cached(self) -> None:
+        # MINECRAFT-571 55866: a 206 with the CORRECT requested length but
+        # the WRONG actual bytes (its own Content-Range correctly names
+        # the wrong offsets it actually served) must not be cached under
+        # the requested key just because the length happens to match.
+        server = self._start_server()
+        port = server.server_address[1]
+        self.upstream.wrong_offset_206_next = (20, 29)  # requested 10-19
+
+        status, body = _get(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status, 206)
+        # The real (wrong-range) body is still forwarded through as-is.
+        self.assertEqual(body, self.dem_bytes[20:30])
+        self.assertEqual(_stats(port)["cached_entries"], 0)
+
+        # Retryable: a correct request right after still works and caches.
+        status2, body2 = _get(port, DEM_PATH, "bytes=10-19")
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, self.dem_bytes[10:20])
+        self.assertEqual(_stats(port)["cached_entries"], 1)
+
+    def test_old_cache_schema_is_invalidated_on_open(self) -> None:
+        # MINECRAFT-571 55866: existing rows written before the
+        # Content-Range endpoint check existed cannot be retroactively
+        # verified, so opening a pre-migration database must wipe them
+        # rather than risk serving one. Simulated here by writing directly
+        # under schema version 1 (no 'meta' row), then opening normally.
+        import sqlite3
+
+        path = os.path.join(self.tmpdir.name, "legacy.sqlite3")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE entries (key TEXT PRIMARY KEY, status INTEGER NOT NULL,"
+            " body BLOB NOT NULL, size INTEGER NOT NULL, last_access REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO entries VALUES (?, 206, ?, ?, 0.0)",
+            (Cache.key(DEM_PATH, 0, 7), self.dem_bytes[0:8], 8),
+        )
+        conn.commit()
+        conn.close()
+
+        cache = Cache(path, max_bytes=2 << 30)
+        try:
+            self.assertEqual(cache.stats()["cached_entries"], 0)
+        finally:
+            cache.close()
+
+        # Reopening the now-migrated database again does not wipe it a
+        # second time (the version row persists).
+        cache2 = Cache(path, max_bytes=2 << 30)
+        try:
+            cache2.put(Cache.key(DEM_PATH, 0, 7), CachedRange(status=206, body=self.dem_bytes[0:8]))
+            self.assertEqual(cache2.stats()["cached_entries"], 1)
+        finally:
+            cache2.close()
+        cache3 = Cache(path, max_bytes=2 << 30)
+        try:
+            self.assertEqual(cache3.stats()["cached_entries"], 1)
+        finally:
+            cache3.close()
 
 
 if __name__ == "__main__":
